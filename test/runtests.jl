@@ -164,9 +164,7 @@ try
                         (:repl_completion, ("complete_m", "complete_m")))
     @test completion_msg[1] == :completion_result
 
-    if VERSION > v"1.12"
-        @test_broken completion_msg[2] == (["complete_me_1", "complete_me_2"], "complete_m", true)
-    end
+    @test completion_msg[2] == (["complete_me_1", "complete_me_2"], "complete_m", true)
     # Evaluation in other modules
     runcommand("""module TestMod
                   struct SomeStruct

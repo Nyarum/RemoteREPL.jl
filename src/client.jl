@@ -111,7 +111,14 @@ mutable struct Connection
     socket::Union{IO,Nothing}
     in_module::Union{Symbol, Expr}
     session_id::UUID
+    request_lock::ReentrantLock
+    write_lock::ReentrantLock
 end
+
+# Preserve the positional constructor used by existing clients and tests.
+Connection(host, port, tunnel, ssh_opts, region, namespace, socket, in_module, session_id) =
+    Connection(host, port, tunnel, ssh_opts, region, namespace, socket, in_module, session_id,
+               ReentrantLock(), ReentrantLock())
 
 function Connection(; host::Union{AbstractString,Sockets.IPAddr}=Sockets.localhost,
                     port::Integer=DEFAULT_PORT,
@@ -162,76 +169,90 @@ function ensure_connected!(conn)
 end
 
 function Base.close(conn::Connection)
-    try
-        if !isnothing(conn.socket) && isopen(conn.socket)
-            serialize(conn.socket, (:exit,nothing))
-            close(conn.socket)
+    lock(conn.request_lock) do
+        lock(conn.write_lock) do
+            try
+                if !isnothing(conn.socket) && isopen(conn.socket)
+                    serialize(conn.socket, (:exit,nothing))
+                    close(conn.socket)
+                end
+            finally
+                conn.socket = nothing
+            end
         end
-    finally
-        conn.socket = nothing
     end
 end
 
 function ensure_connected!(f::Function, conn::Connection; retries=1)
-    n_try = 1
-    while true
-        try
-            ensure_connected!(conn)
-            return f()
-        catch exc
-            if exc isa RemoteException
-                # This is an expected error - do not retry
-                rethrow()
-            end
+    lock(conn.request_lock) do
+        n_try = 1
+        while true
             try
-                close(conn)
-            catch
-                exc isa Base.IOError || rethrow()
+                ensure_connected!(conn)
+                return f()
+            catch exc
+                if exc isa RemoteException
+                    # This is an expected error - do not retry
+                    rethrow()
+                end
+                try
+                    close(conn)
+                catch
+                    exc isa Base.IOError || rethrow()
+                end
+                if n_try == retries+1
+                    @error "Network or internal error running remote repl" exception=exc,catch_backtrace()
+                    return nothing
+                end
+                n_try += 1
             end
-            if n_try == retries+1
-                @error "Network or internal error running remote repl" exception=exc,catch_backtrace()
-                return nothing
-            end
-            n_try += 1
         end
     end
 end
 
 function send_and_receive(conn::Connection, request; read_response=true)
-    serialize(conn.socket, request)
-    flush(conn.socket)
-    if !read_response
-        return (:nothing, nothing)
-    end
-    max_tries = 3
-    for i = 1:max_tries
-        try
-            return deserialize(conn.socket)
-        catch exc
-            # If an InterruptException is caught here while waiting for a
-            # response from the server, we assume the user was trying to
-            # interrupt the remote evaluation.
-            #
-            # This isn't perfect. For example, for large messages the user
-            # might interrupt the deserialization while waiting on socket IO,
-            # and corrupt the stream. However, there's not much we can do about
-            # this without improving the Julia runtime.
-            if exc isa InterruptException
-                if i < max_tries
-                    send_interrupt(conn)
-                    continue
-                else
-                    close(conn)
-                    return (:error, "ERROR: Failed to interrupt server, connection closed!")
+    lock(conn.request_lock) do
+        lock(conn.write_lock) do
+            serialize(conn.socket, request)
+            flush(conn.socket)
+        end
+        if !read_response
+            return (:nothing, nothing)
+        end
+        max_tries = 3
+        for i = 1:max_tries
+            try
+                return deserialize(conn.socket)
+            catch exc
+                # If an InterruptException is caught here while waiting for a
+                # response from the server, we assume the user was trying to
+                # interrupt the remote evaluation.
+                #
+                # This isn't perfect. For example, for large messages the user
+                # might interrupt the deserialization while waiting on socket IO,
+                # and corrupt the stream. However, there's not much we can do about
+                # this without improving the Julia runtime.
+                if exc isa InterruptException
+                    if i < max_tries
+                        send_interrupt(conn)
+                        continue
+                    else
+                        close(conn)
+                        return (:error, "ERROR: Failed to interrupt server, connection closed!")
+                    end
                 end
+                rethrow()
             end
-            rethrow()
         end
     end
 end
 
 function send_interrupt(conn::Connection)
-    serialize(conn.socket, (:interrupt, nothing))
+    # Do not take request_lock: a yielding eval must remain interruptible.
+    lock(conn.write_lock) do
+        serialize(conn.socket, (:interrupt, nothing))
+        flush(conn.socket)
+    end
 end
 
 #-------------------------------------------------------------------------------
@@ -281,6 +302,10 @@ function REPL.complete_line(provider::RemoteCompletionProvider,
                             state::REPL.LineEdit.PromptState;
                             hint::Bool=false)::
                             Tuple{Vector{String},String,Bool}
+    # Julia can cancel a background hint task at any byte of deserialization.
+    # Such a task must not consume the shared protocol stream. Explicit Tab
+    # completion remains supported; this changes no global REPL options.
+    hint && return (String[], "", false)
     # See REPL.jl complete_line(c::REPLCompletionProvider, s::PromptState)
     partial = REPL.beforecursor(state.input_buffer)
     full = REPL.LineEdit.input_string(state)

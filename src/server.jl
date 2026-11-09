@@ -80,8 +80,9 @@ function eval_message(session, messageid, messagebody)
         elseif messageid === :repl_completion
             # See REPL.jl complete_line(c::REPLCompletionProvider, s::PromptState)
             partial, full = messagebody
-            ret, range, should_complete = REPL.completions(full, lastindex(partial),
-                                                           session.in_module)
+            # The evaluator task predates newly loaded/revised global bindings.
+            ret, range, should_complete = Base.invokelatest(REPL.completions,
+                full, lastindex(partial), session.in_module)
             result = (unique!(map(REPL.completion_text, ret)),
                       partial[range], should_complete)
             return (:completion_result, result)
